@@ -10,14 +10,16 @@ function run(): void {
   const start = source.indexOf('  markAccept(markId: string): boolean {');
   assert(start !== -1, 'Expected markAccept in the editor source');
   const block = source.slice(start, source.indexOf('\n  /**', start));
+  const shareBranch = block.split('    let success = false;')[0];
+  assert(shareBranch.length > 0 && shareBranch.length < block.length, 'Expected the share-mode branch to precede the local accept path');
 
-  const localApplyIndex = block.indexOf('applied = acceptMark(view, markId, parser);');
-  const shareMutationIndex = block.indexOf('void shareClient.acceptSuggestion(markId, actor)');
-  assert(localApplyIndex !== -1, 'Expected share-mode markAccept to apply the suggestion locally');
-  assert(shareMutationIndex !== -1, 'Expected share-mode markAccept to persist through the share mutation');
   assert(
-    localApplyIndex < shareMutationIndex,
-    'Expected the local apply to run before the share mutation so the client cannot push pre-accept content over it',
+    shareBranch.includes('applied = acceptMark(view, markId, parser);'),
+    'Expected share-mode markAccept to apply the suggestion locally',
+  );
+  assert(
+    !shareBranch.includes('shareClient.acceptSuggestion(markId, actor)'),
+    'Expected share-mode markAccept to skip the redundant accept mutation after the local apply',
   );
 
   console.log('share-accept-local-apply: assertions passed');

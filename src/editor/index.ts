@@ -8506,26 +8506,10 @@ class ProofEditorImpl implements ProofEditor {
       }
       captureEvent('suggestion_accepted', { count: 1 });
 
-      const actor = getCurrentActor();
-      void shareClient.acceptSuggestion(markId, actor).then((result) => {
-        if (!result || 'error' in result || result.success !== true) return;
-        const serverMarks = (result.marks && typeof result.marks === 'object' && !Array.isArray(result.marks))
-          ? result.marks as Record<string, StoredMark>
-          : null;
-        if (!serverMarks) return;
-        this.lastReceivedServerMarks = { ...serverMarks };
-        this.initialMarksSynced = true;
-        if (this.editor) {
-          this.editor.action((innerCtx) => {
-            const innerView = innerCtx.get(editorViewCtx);
-            applyRemoteMarks(innerView, serverMarks, { hydrateAnchors: this.collabCanEdit });
-            const stats = getAuthorshipStats(innerView);
-            this.bridge.authorshipStatsUpdated(stats);
-          });
-        }
-      }).catch((error) => {
-        console.error('[markAccept] Failed to persist suggestion acceptance via share mutation:', error);
-      });
+      // The local apply above edits the collaborative document, so the change
+      // reaches the server through the normal collab sync. The accept mutation
+      // is not repeated: the mark is already gone locally, so the server-side
+      // accept would conflict instead of persisting anything new.
       return true;
     }
 
