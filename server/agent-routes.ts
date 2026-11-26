@@ -3572,6 +3572,9 @@ agentRoutes.post('/:slug/marks/accept', async (req: Request, res: Response) => {
           ...toErrorTraceData(error),
         },
       });
+      if (barrierAcquired) {
+        releaseRewriteLockImmediately(slug);
+      }
       releaseIdempotentMutationResult(replay, mutationRoute, slug, `rewrite_barrier_failed:${reason}`);
       sendMutationResponse(
         res,
