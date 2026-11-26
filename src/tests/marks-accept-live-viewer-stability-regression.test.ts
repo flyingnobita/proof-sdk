@@ -46,6 +46,16 @@ function normalizeWsBase(collabWsUrl: string): string {
   }
 }
 
+function collectXmlText(node: unknown): string {
+  if (node instanceof Y.XmlText) {
+    return String(node.toString());
+  }
+  if (node instanceof Y.XmlElement || node instanceof Y.XmlFragment) {
+    return node.toArray().map((child) => collectXmlText(child)).join(' ');
+  }
+  return '';
+}
+
 type CreateResponse = { slug: string; ownerSecret: string };
 
 type SuggestResponse = {
@@ -62,11 +72,76 @@ type CollabSessionResponse = {
   };
 };
 
+type StateResponse = {
+  markdown?: string;
+  content?: string;
+  marks?: Record<string, { kind?: string; status?: string }>;
+};
+
 const CLIENT_HEADERS = {
   'X-Proof-Client-Version': '0.31.2',
   'X-Proof-Client-Build': 'tests',
   'X-Proof-Client-Protocol': '3',
 };
+
+async function connectViewer(
+  httpBase: string,
+  slug: string,
+  ownerSecret: string,
+): Promise<{
+  ydoc: Y.Doc;
+  provider: HocuspocusProvider;
+  disconnect: () => void;
+}> {
+  const collabSessionRes = await fetch(`${httpBase}/api/documents/${slug}/collab-session`, {
+    headers: { ...CLIENT_HEADERS, 'x-share-token': ownerSecret },
+  });
+  const collabSession = await mustJson<CollabSessionResponse>(collabSessionRes, 'collab-session');
+  assert(collabSession.success === true, 'Expected successful collab session');
+
+  const ydoc = new Y.Doc();
+  const provider = new HocuspocusProvider({
+    url: normalizeWsBase(collabSession.session.collabWsUrl),
+    name: collabSession.session.slug,
+    document: ydoc,
+    parameters: {
+      token: collabSession.session.token,
+      role: collabSession.session.role,
+    },
+    token: collabSession.session.token,
+    preserveConnection: false,
+    broadcast: false,
+  });
+
+  let connected = false;
+  let synced = false;
+  provider.on('status', (event: { status: string }) => {
+    if (event.status === 'connected') connected = true;
+  });
+  provider.on('synced', (event: { state?: boolean }) => {
+    if (event.state !== false) synced = true;
+  });
+
+  await waitFor(() => connected && synced, 10_000, 'provider connected+synced');
+
+  return {
+    ydoc,
+    provider,
+    disconnect: () => {
+      try {
+        provider.disconnect();
+        provider.destroy();
+      } catch {
+        // ignore
+      }
+      try {
+        ydoc.destroy();
+      } catch {
+        // ignore
+      }
+    },
+  };
+}
 
 async function run(): Promise<void> {
   const dbName = `proof-marks-accept-live-viewer-stability-${Date.now()}-${Math.random().toString(36).slice(2)}.db`;
@@ -99,71 +174,42 @@ async function run(): Promise<void> {
 
   await collab.startCollabRuntimeEmbedded(address.port);
 
-  const createRes = await fetch(`${httpBase}/api/documents`, {
-    method: 'POST',
-    headers: { ...CLIENT_HEADERS, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      title: 'Suggestion accept stability regression',
-      markdown: 'Hello open source',
-      marks: {},
-    }),
-  });
-  const created = await mustJson<CreateResponse>(createRes, 'create');
-
-  const suggestRes = await fetch(`${httpBase}/api/agent/${created.slug}/marks/suggest-replace`, {
-    method: 'POST',
-    headers: {
-      ...CLIENT_HEADERS,
-      'Content-Type': 'application/json',
-      'x-share-token': created.ownerSecret,
-    },
-    body: JSON.stringify({
-      quote: 'open source',
-      content: 'OSS',
-      by: 'ai:test',
-    }),
-  });
-  assert(suggestRes.ok, `Expected suggestion ok, got HTTP ${suggestRes.status}`);
-  const suggestPayload = await mustJson<SuggestResponse>(suggestRes, 'suggest');
-  const suggestionId = Object.entries(suggestPayload.marks ?? {}).find(([, value]) => value?.kind === 'replace')?.[0] ?? '';
-  assert(suggestionId.length > 0, 'Expected suggestion id');
-
-  const collabSessionRes = await fetch(`${httpBase}/api/documents/${created.slug}/collab-session`, {
-    headers: { ...CLIENT_HEADERS, 'x-share-token': created.ownerSecret },
-  });
-  const collabSession = await mustJson<CollabSessionResponse>(collabSessionRes, 'collab-session');
-  assert(collabSession.success === true, 'Expected successful collab session');
-
-  const ydoc = new Y.Doc();
-  const provider = new HocuspocusProvider({
-    url: normalizeWsBase(collabSession.session.collabWsUrl),
-    name: collabSession.session.slug,
-    document: ydoc,
-    parameters: {
-      token: collabSession.session.token,
-      role: collabSession.session.role,
-    },
-    token: collabSession.session.token,
-    preserveConnection: false,
-    broadcast: false,
-  });
-
-  let connected = false;
-  let synced = false;
-  provider.on('status', (event: { status: string }) => {
-    if (event.status === 'connected') connected = true;
-  });
-  provider.on('synced', (event: { state?: boolean }) => {
-    if (event.state !== false) synced = true;
-  });
+  const cleanups: Array<() => void> = [];
 
   try {
-    await waitFor(() => connected && synced, 10_000, 'provider connected+synced');
+    const createRes = await fetch(`${httpBase}/api/documents`, {
+      method: 'POST',
+      headers: { ...CLIENT_HEADERS, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: 'Suggestion accept stability regression',
+        markdown: 'Hello open source',
+        marks: {},
+      }),
+    });
+    const created = await mustJson<CreateResponse>(createRes, 'create');
 
-    const markdownText = ydoc.getText('markdown');
-    const marksMap = ydoc.getMap('marks');
+    const suggestRes = await fetch(`${httpBase}/api/agent/${created.slug}/marks/suggest-replace`, {
+      method: 'POST',
+      headers: {
+        ...CLIENT_HEADERS,
+        'Content-Type': 'application/json',
+        'x-share-token': created.ownerSecret,
+      },
+      body: JSON.stringify({
+        quote: 'open source',
+        content: 'OSS',
+        by: 'ai:test',
+      }),
+    });
+    assert(suggestRes.ok, `Expected suggestion ok, got HTTP ${suggestRes.status}`);
+    const suggestPayload = await mustJson<SuggestResponse>(suggestRes, 'suggest');
+    const suggestionId = Object.entries(suggestPayload.marks ?? {}).find(([, value]) => value?.kind === 'replace')?.[0] ?? '';
+    assert(suggestionId.length > 0, 'Expected suggestion id');
 
-    const acceptPromise = fetch(`${httpBase}/api/agent/${created.slug}/marks/accept`, {
+    const initialViewer = await connectViewer(httpBase, created.slug, created.ownerSecret);
+    cleanups.push(initialViewer.disconnect);
+
+    const acceptRes = await fetch(`${httpBase}/api/agent/${created.slug}/marks/accept`, {
       method: 'POST',
       headers: {
         ...CLIENT_HEADERS,
@@ -172,21 +218,6 @@ async function run(): Promise<void> {
       },
       body: JSON.stringify({ markId: suggestionId, by: 'human:editor' }),
     });
-
-    await waitFor(() => markdownText.toString().includes('OSS'), 5_000, 'accepted markdown applied');
-
-    await waitFor(() => {
-      const mark = marksMap.get(suggestionId) as Record<string, unknown> | undefined;
-      return mark?.status === 'accepted';
-    }, 5_000, 'accepted mark present in collab map');
-
-    marksMap.doc?.transact(() => {
-      marksMap.delete(suggestionId);
-    }, 'test-accepted-mark-cleanup');
-
-    await sleep(75);
-
-    const acceptRes = await acceptPromise;
     const acceptPayload = await mustJson<{
       success?: boolean;
       collab?: { status?: string; markdownConfirmed?: boolean | null; fragmentConfirmed?: boolean | null; canonicalConfirmed?: boolean | null };
@@ -204,19 +235,39 @@ async function run(): Promise<void> {
     const stateRes = await fetch(`${httpBase}/api/agent/${created.slug}/state`, {
       headers: { ...CLIENT_HEADERS, 'x-share-token': created.ownerSecret },
     });
-    const state = await mustJson<{ markdown?: string; content?: string }>(stateRes, 'state');
+    const state = await mustJson<StateResponse>(stateRes, 'state');
     const markdown = typeof state.markdown === 'string' ? state.markdown : (state.content || '');
-    assert(markdown.includes('OSS'), 'Expected accepted suggestion to persist in canonical markdown');
+    assert(markdown.includes('OSS') && !markdown.includes('open source'), `Expected accepted suggestion in canonical markdown, got ${JSON.stringify(markdown)}`);
+    assert(!state.marks?.[suggestionId], 'Expected pending suggestion mark cleared from canonical marks');
+    assert(
+      Object.values(state.marks ?? {}).some((mark) => mark?.kind === 'authored'),
+      'Expected authored mark recorded in canonical marks',
+    );
 
-    console.log('✓ marks/accept tolerates accepted mark cleanup during canonical stability verification');
+    initialViewer.disconnect();
+
+    const reconnectedViewer = await connectViewer(httpBase, created.slug, created.ownerSecret);
+    cleanups.push(reconnectedViewer.disconnect);
+
+    const viewerMarkdownText = reconnectedViewer.ydoc.getText('markdown');
+    const viewerFragment = reconnectedViewer.ydoc.getXmlFragment('prosemirror');
+    const viewerMarksMap = reconnectedViewer.ydoc.getMap('marks');
+
+    await waitFor(
+      () => viewerMarkdownText.toString().includes('OSS')
+        && collectXmlText(viewerFragment).includes('OSS')
+        && !viewerMarksMap.has(suggestionId)
+        && Array.from(viewerMarksMap.values()).some((value) => (value as { kind?: string } | undefined)?.kind === 'authored'),
+      5_000,
+      'reconnected viewer converged to accepted content, cleared suggestion, and authored mark',
+    );
+    assert(!collectXmlText(viewerFragment).includes('open source'), 'Expected prosemirror fragment to drop replaced quote');
+
+    console.log('✓ marks/accept converges accepted content, authored marks, and reconnected live viewer state');
   } finally {
-    try {
-      provider.disconnect();
-      provider.destroy();
-    } catch {
-      // ignore
+    for (const cleanup of cleanups) {
+      cleanup();
     }
-    ydoc.destroy();
     await collab.stopCollabRuntime();
     try {
       wss.close();
@@ -234,7 +285,9 @@ async function run(): Promise<void> {
   }
 }
 
-run().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+run()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });

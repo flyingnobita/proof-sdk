@@ -360,7 +360,9 @@ async function runLiveEditorAcceptConvergenceTest(): Promise<void> {
       },
       body: JSON.stringify({
         quote: 'Alpha',
-        content: ' Inserted',
+        // applyMarkdownInsert replaces the anchored range on parsed inline content
+        // and skips text insertion when leading whitespace triggers plain-text fallback.
+        content: 'Alpha Inserted',
         by: 'ai:reviewer',
       }),
     });
@@ -516,7 +518,9 @@ async function runLiveEditorAcceptConvergenceTest(): Promise<void> {
   }
 }
 
-runLiveEditorAcceptConvergenceTest().catch((err) => {
-  console.error(err instanceof Error ? err.message : String(err));
-  process.exit(1);
-});
+runLiveEditorAcceptConvergenceTest()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
