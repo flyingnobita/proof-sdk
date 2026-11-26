@@ -8482,14 +8482,29 @@ class ProofEditorImpl implements ProofEditor {
 
     if (this.isShareMode) {
       let canAccept = false;
+      let applied = false;
       this.editor.action((ctx) => {
         const view = ctx.get(editorViewCtx);
+        const parser = ctx.get(parserCtx);
         canAccept = getPendingSuggestions(getMarks(view.state)).some((mark) => mark.id === markId);
+        if (!canAccept) return;
+        applied = acceptMark(view, markId, parser);
+        if (!applied) return;
+        // Adopt the locally applied marks before the server round-trip so the
+        // client's own sync cannot push pre-accept content over the mutation.
+        const metadata = getMarkMetadataWithQuotes(view.state);
+        this.lastReceivedServerMarks = { ...metadata };
+        this.initialMarksSynced = true;
       });
       if (!canAccept) {
         console.warn('[markAccept] Suggestion not pending in share mode:', markId);
         return false;
       }
+      if (!applied) {
+        console.warn('[markAccept] Failed to apply suggestion locally in share mode:', markId);
+        return false;
+      }
+      captureEvent('suggestion_accepted', { count: 1 });
 
       const actor = getCurrentActor();
       void shareClient.acceptSuggestion(markId, actor).then((result) => {
@@ -8508,7 +8523,6 @@ class ProofEditorImpl implements ProofEditor {
             this.bridge.authorshipStatsUpdated(stats);
           });
         }
-        captureEvent('suggestion_accepted', { count: 1 });
       }).catch((error) => {
         console.error('[markAccept] Failed to persist suggestion acceptance via share mutation:', error);
       });
