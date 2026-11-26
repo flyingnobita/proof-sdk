@@ -3495,59 +3495,152 @@ agentRoutes.post('/:slug/marks/accept', async (req: Request, res: Response) => {
   const payload = asPayload(req.body);
   const mutationContext = await enforceMutationPrecondition(res, slug, mutationRoute, 'suggestion.accept', payload, replay);
   if (!mutationContext) return;
-  const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/accept', payload, mutationContext);
-  maybeLogMarkHydrationMismatch(mutationRoute, slug, payload, mutationContext, result);
-  if (result.status >= 200 && result.status < 300) {
-    const collabStatus = await notifyCollabMutation(
-      slug,
-      buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.accept' }),
-      {
-        verify: true,
-        source: 'marks.accept',
-        stabilityMs: EDIT_COLLAB_STABILITY_MS,
-        strictLiveDoc: true,
-        apply: false,
-      },
-    );
-    if (isRecord(result.body)) {
-      result.body = {
-        ...result.body,
-        collab: {
-          status: collabStatus.confirmed ? 'confirmed' : 'pending',
-          reason: collabStatus.reason ?? (collabStatus.confirmed ? 'confirmed' : 'sync_timeout'),
-          markdownConfirmed: collabStatus.markdownConfirmed ?? null,
-          fragmentConfirmed: collabStatus.fragmentConfirmed ?? null,
-          canonicalConfirmed: collabStatus.canonicalConfirmed ?? null,
+  let barrierAcquired = false;
+  if (getCollabRuntime().enabled && getActiveCollabClientCount(slug) > 0) {
+    const preBarrierMutationBase = (
+      mutationContext.precondition?.mode === 'token'
+      && mutationContext.mutationBase
+    )
+      ? mutationContext.mutationBase
+      : null;
+    const barrierStartedAt = Date.now();
+    try {
+      await prepareRewriteCollabBarrier(slug, {
+        validateWhileLocked: async () => {
+          const lockedDoc = getDocumentBySlug(slug) ?? mutationContext.doc;
+          const currentMutationBase = mutationContext.precondition?.mode === 'token'
+            ? await resolveRouteMutationBase(slug)
+            : null;
+          const lockedPrecondition = validateOpPrecondition(
+            getMutationContractStage(),
+            'suggestion.accept',
+            lockedDoc,
+            payload,
+            currentMutationBase?.token ?? null,
+          );
+          if (!lockedPrecondition.ok) {
+            throw new RewriteBarrierPreconditionError(lockedPrecondition);
+          }
         },
-      };
-    }
-    if (!collabStatus.confirmed) {
-      const failureBody = {
-        success: false,
-        code: 'COLLAB_SYNC_FAILED',
-        error: 'Suggestion acceptance did not converge to live collaboration state',
-        reason: collabStatus.reason ?? 'sync_timeout',
-        retryWithState: `/api/agent/${slug}/state`,
-        collab: {
-          status: 'pending',
-          reason: collabStatus.reason ?? 'sync_timeout',
-          markdownConfirmed: collabStatus.markdownConfirmed ?? null,
-          fragmentConfirmed: collabStatus.fragmentConfirmed ?? null,
-          canonicalConfirmed: collabStatus.canonicalConfirmed ?? null,
+      });
+      barrierAcquired = true;
+      if (mutationContext.precondition?.mode === 'token' && preBarrierMutationBase) {
+        const postBarrierMutationBase = await resolveRouteMutationBase(slug);
+        const barrierOnlyTokenDrift = (
+          postBarrierMutationBase
+          && mutationContext.precondition.baseToken === preBarrierMutationBase.token
+          && postBarrierMutationBase.token !== preBarrierMutationBase.token
+          && sameRouteMutationBaseContent(postBarrierMutationBase, preBarrierMutationBase)
+        );
+        if (barrierOnlyTokenDrift) {
+          mutationContext.precondition.baseToken = postBarrierMutationBase.token;
+          mutationContext.mutationBase = postBarrierMutationBase;
+        }
+      }
+      recordRewriteBarrierLatency(mutationRoute, Date.now() - barrierStartedAt);
+    } catch (error) {
+      if (error instanceof RewriteBarrierPreconditionError) {
+        const latestDoc = getDocumentBySlug(slug) ?? mutationContext.doc;
+        releaseIdempotentMutationResult(replay, mutationRoute, slug, error.code);
+        sendMutationResponse(
+          res,
+          error.status,
+          {
+            success: false,
+            code: error.code,
+            error: error.message,
+            latestUpdatedAt: latestDoc.updated_at,
+            latestRevision: latestDoc.revision,
+            retryWithState: `/api/agent/${slug}/state`,
+          },
+          { route: mutationRoute, slug, retryWithState: `/api/agent/${slug}/state` },
+        );
+        return;
+      }
+      const reason = classifyRewriteBarrierFailureReason(error);
+      recordRewriteBarrierFailure(mutationRoute, reason);
+      recordRewriteBarrierLatency(mutationRoute, Date.now() - barrierStartedAt);
+      traceServerIncident({
+        slug,
+        subsystem: 'agent_routes',
+        level: 'error',
+        eventType: 'rewrite.barrier_failed',
+        message: 'Agent marks/accept failed because the collab barrier could not complete',
+        data: {
+          route: mutationRoute,
+          reason,
+          ...toErrorTraceData(error),
         },
-      } satisfies Record<string, unknown>;
-      storeIdempotentMutationResult(replay, mutationRoute, slug, 409, failureBody);
+      });
+      releaseIdempotentMutationResult(replay, mutationRoute, slug, `rewrite_barrier_failed:${reason}`);
       sendMutationResponse(
         res,
-        409,
-        failureBody,
+        503,
+        rewriteBarrierFailedResponseBody(slug, reason),
         { route: mutationRoute, slug, retryWithState: `/api/agent/${slug}/state` },
       );
       return;
     }
   }
-  storeIdempotentMutationResult(replay, mutationRoute, slug, result.status, result.body);
-  sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
+  try {
+    const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/accept', payload, mutationContext);
+    maybeLogMarkHydrationMismatch(mutationRoute, slug, payload, mutationContext, result);
+    if (result.status >= 200 && result.status < 300) {
+      const collabStatus = await notifyCollabMutation(
+        slug,
+        buildParticipationFromMutation(req, slug, payload, { details: 'suggestion.accept' }),
+        {
+          verify: true,
+          source: 'marks.accept',
+          stabilityMs: EDIT_COLLAB_STABILITY_MS,
+          strictLiveDoc: false,
+          apply: false,
+        },
+      );
+      if (isRecord(result.body)) {
+        result.body = {
+          ...result.body,
+          collab: {
+            status: collabStatus.confirmed ? 'confirmed' : 'pending',
+            reason: collabStatus.reason ?? (collabStatus.confirmed ? 'confirmed' : 'sync_timeout'),
+            markdownConfirmed: collabStatus.markdownConfirmed ?? null,
+            fragmentConfirmed: collabStatus.fragmentConfirmed ?? null,
+            canonicalConfirmed: collabStatus.canonicalConfirmed ?? null,
+          },
+        };
+      }
+      if (!collabStatus.confirmed) {
+        const failureBody = {
+          success: false,
+          code: 'COLLAB_SYNC_FAILED',
+          error: 'Suggestion acceptance did not converge to live collaboration state',
+          reason: collabStatus.reason ?? 'sync_timeout',
+          retryWithState: `/api/agent/${slug}/state`,
+          collab: {
+            status: 'pending',
+            reason: collabStatus.reason ?? 'sync_timeout',
+            markdownConfirmed: collabStatus.markdownConfirmed ?? null,
+            fragmentConfirmed: collabStatus.fragmentConfirmed ?? null,
+            canonicalConfirmed: collabStatus.canonicalConfirmed ?? null,
+          },
+        } satisfies Record<string, unknown>;
+        storeIdempotentMutationResult(replay, mutationRoute, slug, 409, failureBody);
+        sendMutationResponse(
+          res,
+          409,
+          failureBody,
+          { route: mutationRoute, slug, retryWithState: `/api/agent/${slug}/state` },
+        );
+        return;
+      }
+    }
+    storeIdempotentMutationResult(replay, mutationRoute, slug, result.status, result.body);
+    sendMutationResponse(res, result.status, result.body, { route: mutationRoute, slug });
+  } finally {
+    if (barrierAcquired) {
+      releaseRewriteLockImmediately(slug);
+    }
+  }
 });
 
 agentRoutes.post('/:slug/marks/reject', async (req: Request, res: Response) => {
