@@ -3973,9 +3973,10 @@ agentRoutes.post('/:slug/events/ack', (req: Request, res: Response) => {
 });
 
 agentRoutes.use(async (req: Request, res: Response) => {
-  const slug = getSlug(req);
   const method = req.method.toUpperCase();
   const path = req.path || '/';
+  // Router-level middleware has no route params, so the slug must come from the path.
+  const slug = getSlug(req) ?? (path.split('/').filter(Boolean)[0] ?? null);
   const mutationRoute = `${method} ${path}`;
   if (!slug) {
     sendMutationResponse(res, 400, { success: false, error: 'Invalid slug' }, { route: mutationRoute });
