@@ -1,0 +1,13 @@
+{
+  "mcp": {
+    "servers": {
+      "browse": {
+        "type": "local",
+        "command": [
+          "browse",
+          "mcp"
+        ]
+      }
+    }
+  }
+}
