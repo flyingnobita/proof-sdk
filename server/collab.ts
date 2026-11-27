@@ -29,6 +29,7 @@ import {
   getYUpdatesAtOrAfter,
   getYUpdatesAfter,
   listDocsWithStaleProjection,
+  listMarkTombstonesForDocument,
   listSuspiciousProjectionCandidates,
   noteDocumentLiveCollabLease,
   removeResurrectedMarksFromPayload,
@@ -870,10 +871,11 @@ const projectionRepairWorkerOversizedSeen = new Map<string, { fingerprint: strin
 const rewriteLockSlugs = new Map<string, ReturnType<typeof setTimeout>>();
 const REWRITE_LOCK_COOLDOWN_MS = 5_000; // keep lock for 5s after rewrite completes
 
-export function acquireRewriteLock(slug: string): void {
+export function acquireRewriteLock(slug: string, ttlMs: number = REWRITE_LOCK_COOLDOWN_MS): void {
   const existing = rewriteLockSlugs.get(slug);
   if (existing) clearTimeout(existing);
-  rewriteLockSlugs.set(slug, setTimeout(() => rewriteLockSlugs.delete(slug), REWRITE_LOCK_COOLDOWN_MS));
+  const effectiveTtlMs = Number.isFinite(ttlMs) && ttlMs > 0 ? Math.trunc(ttlMs) : REWRITE_LOCK_COOLDOWN_MS;
+  rewriteLockSlugs.set(slug, setTimeout(() => rewriteLockSlugs.delete(slug), effectiveTtlMs));
   console.log('[collab] rewrite lock acquired', { slug });
 }
 
@@ -2775,6 +2777,76 @@ function shouldPreserveMissingMark(
   if (kind === 'insert' || kind === 'delete' || kind === 'replace') {
     return options.includeSuggestions === true;
   }
+  return true;
+}
+
+const TOMBSTONE_SCRUB_TRANSACTION_ORIGIN = 'server-tombstone-scrub';
+
+function scrubTombstonedMarksFromYDoc(slug: string, ydoc: Y.Doc): boolean {
+  const tombstones = listMarkTombstonesForDocument(slug);
+  if (tombstones.length === 0) return false;
+  const tombstonedSuggestionIds = new Set<string>();
+  for (const tombstone of tombstones) {
+    if (tombstone.status === 'accepted' || tombstone.status === 'rejected') {
+      tombstonedSuggestionIds.add(tombstone.mark_id);
+    }
+  }
+  if (tombstonedSuggestionIds.size === 0) return false;
+
+  const marksMap = ydoc.getMap('marks');
+  const markIdsToDelete: string[] = [];
+  marksMap.forEach((value, markId) => {
+    if (!tombstonedSuggestionIds.has(markId)) return;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      markIdsToDelete.push(markId);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const status = typeof record.status === 'string' ? record.status : '';
+    const resolved = record.resolved === true;
+    if (!(resolved || status === 'accepted' || status === 'rejected')) {
+      markIdsToDelete.push(markId);
+    }
+  });
+
+  const fragmentScrubOps: Array<{ xmlText: Y.XmlText; index: number; length: number }> = [];
+  const walkFragment = (node: unknown): void => {
+    if (node instanceof Y.XmlText) {
+      const delta = node.toDelta() as Array<{ insert?: unknown; attributes?: Record<string, unknown> }>;
+      let offset = 0;
+      for (const op of delta) {
+        const len = typeof op.insert === 'string' ? op.insert.length : 1;
+        const proofSuggestion = op.attributes?.proofSuggestion;
+        const suggestionId = proofSuggestion && typeof proofSuggestion === 'object' && !Array.isArray(proofSuggestion)
+          ? (proofSuggestion as { id?: unknown }).id
+          : null;
+        if (typeof suggestionId === 'string' && tombstonedSuggestionIds.has(suggestionId)) {
+          fragmentScrubOps.push({ xmlText: node, index: offset, length: len });
+        }
+        offset += len;
+      }
+      return;
+    }
+    if (node instanceof Y.XmlElement || node instanceof Y.XmlFragment) {
+      for (const child of node.toArray()) {
+        walkFragment(child);
+      }
+    }
+  };
+  walkFragment(ydoc.getXmlFragment('prosemirror'));
+
+  if (markIdsToDelete.length === 0 && fragmentScrubOps.length === 0) {
+    return false;
+  }
+
+  ydoc.transact(() => {
+    for (const markId of markIdsToDelete) {
+      marksMap.delete(markId);
+    }
+    for (const op of fragmentScrubOps) {
+      op.xmlText.format(op.index, op.length, { proofSuggestion: null });
+    }
+  }, TOMBSTONE_SCRUB_TRANSACTION_ORIGIN);
   return true;
 }
 
@@ -7623,6 +7695,7 @@ async function persistDoc(
       if (persistPauseHookForTests) {
         await persistPauseHookForTests({ slug });
       }
+      scrubTombstonedMarksFromYDoc(slug, ydoc);
       const refreshed = await refreshMarkdownTextFromFragment(slug, ydoc, 'server-projection-refresh');
       if (refreshed.blockedSuspiciousCollapse) {
         persistPending.delete(slug);
@@ -10961,6 +11034,39 @@ async function handleCollabBeforeHandleMessage(data: {
   });
 }
 
+async function handleCollabOnChange(data: {
+  documentName: string;
+  document: Y.Doc;
+  context?: unknown;
+  transactionOrigin?: unknown;
+}): Promise<void> {
+  if (getContextAccessEpoch(data.context) === null) {
+    // Server-origin transactions (e.g. applyCanonicalDocumentToCollab) persist explicitly.
+    return;
+  }
+  if (data.transactionOrigin === TOMBSTONE_SCRUB_TRANSACTION_ORIGIN) {
+    return;
+  }
+  if (shouldDropWriteDuringShutdown(data.documentName, 'onChange')) return;
+  if (shouldDropStaleContextWrite(data.documentName, data.context, 'onChange')) {
+    return;
+  }
+  if (collabInvalidations.has(data.documentName)) {
+    // Ignore changes while we're tearing down the runtime state for this slug.
+    return;
+  }
+  if (isRewriteLocked(data.documentName)) {
+    // A force-rewrite is in flight or cooling down; drop client-originated writes
+    // to prevent stale client state from overwriting the rewrite.
+    console.warn('[collab] onChange blocked by rewrite lock', { slug: data.documentName });
+    return;
+  }
+  scrubTombstonedMarksFromYDoc(data.documentName, data.document);
+  rememberLoadedDoc(data.documentName, data.document);
+  markDocChanged(data.documentName);
+  schedulePersistDoc(data.documentName, data.document);
+}
+
 export function handleCollabWebSocketConnection(socket: unknown, request: unknown): void {
   attachCollabSocketErrorHandler(socket, request, 'ws-router');
   if (!hocuspocusInstance || typeof hocuspocusInstance.handleConnection !== 'function') {
@@ -11124,29 +11230,7 @@ export async function startCollabRuntime(mainHttpPort: number): Promise<CollabRu
         const canonicalDoc = loadedDocs.get(data.documentName) ?? data.document;
         await persistOnStoreDocument(data.documentName, canonicalDoc);
       },
-      async onChange(data: { documentName: string; document: Y.Doc; context?: unknown }) {
-        if (getContextAccessEpoch(data.context) === null) {
-          // Server-origin transactions (e.g. applyCanonicalDocumentToCollab) persist explicitly.
-          return;
-        }
-        if (shouldDropWriteDuringShutdown(data.documentName, 'onChange')) return;
-        if (shouldDropStaleContextWrite(data.documentName, data.context, 'onChange')) {
-          return;
-        }
-        if (collabInvalidations.has(data.documentName)) {
-          // Ignore changes while we're tearing down the runtime state for this slug.
-          return;
-        }
-        if (isRewriteLocked(data.documentName)) {
-          // A force-rewrite is in flight or cooling down; drop client-originated writes
-          // to prevent stale client state from overwriting the rewrite.
-          console.warn('[collab] onChange blocked by rewrite lock', { slug: data.documentName });
-          return;
-        }
-        rememberLoadedDoc(data.documentName, data.document);
-        markDocChanged(data.documentName);
-        schedulePersistDoc(data.documentName, data.document);
-      },
+      onChange: handleCollabOnChange,
       async onDisconnect(data: { context?: unknown }) {
         detachAuthenticatedCollabPresence(data.context);
       },
@@ -11315,26 +11399,7 @@ export async function startCollabRuntimeEmbedded(mainHttpPort: number): Promise<
         const canonicalDoc = loadedDocs.get(data.documentName) ?? data.document;
         await persistOnStoreDocument(data.documentName, canonicalDoc);
       },
-      async onChange(data: { documentName: string; document: Y.Doc; context?: unknown }) {
-        if (getContextAccessEpoch(data.context) === null) {
-          // Server-origin transactions (e.g. applyCanonicalDocumentToCollab) persist explicitly.
-          return;
-        }
-        if (shouldDropWriteDuringShutdown(data.documentName, 'onChange')) return;
-        if (shouldDropStaleContextWrite(data.documentName, data.context, 'onChange')) {
-          return;
-        }
-        if (collabInvalidations.has(data.documentName)) {
-          return;
-        }
-        if (isRewriteLocked(data.documentName)) {
-          console.warn("[collab] onChange blocked by rewrite lock", { slug: data.documentName });
-          return;
-        }
-        rememberLoadedDoc(data.documentName, data.document);
-        markDocChanged(data.documentName);
-        schedulePersistDoc(data.documentName, data.document);
-      },
+      onChange: handleCollabOnChange,
       async onDisconnect(data: { context?: unknown }) {
         detachAuthenticatedCollabPresence(data.context);
       },
@@ -11521,26 +11586,7 @@ export async function startCollabRuntimeAttached(mainHttpServer: HttpServer, mai
         const canonicalDoc = loadedDocs.get(data.documentName) ?? data.document;
         await persistOnStoreDocument(data.documentName, canonicalDoc);
       },
-      async onChange(data: { documentName: string; document: Y.Doc; context?: unknown }) {
-        if (getContextAccessEpoch(data.context) === null) {
-          // Server-origin transactions (e.g. applyCanonicalDocumentToCollab) persist explicitly.
-          return;
-        }
-        if (shouldDropWriteDuringShutdown(data.documentName, 'onChange')) return;
-        if (shouldDropStaleContextWrite(data.documentName, data.context, 'onChange')) {
-          return;
-        }
-        if (collabInvalidations.has(data.documentName)) {
-          return;
-        }
-        if (isRewriteLocked(data.documentName)) {
-          console.warn("[collab] onChange blocked by rewrite lock", { slug: data.documentName });
-          return;
-        }
-        rememberLoadedDoc(data.documentName, data.document);
-        markDocChanged(data.documentName);
-        schedulePersistDoc(data.documentName, data.document);
-      },
+      onChange: handleCollabOnChange,
     } as unknown);
 
     const { WebSocketServer } = await import('ws');
