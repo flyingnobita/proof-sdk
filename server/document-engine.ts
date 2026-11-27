@@ -1502,7 +1502,7 @@ async function persistMarksAsync(
   const yjsBackedMutationBase = context?.mutationBase
     && context.mutationBase.source !== 'projection'
     && context.mutationBase.source !== 'canonical_row';
-  const shouldCommitCanonical = (Boolean(context?.precondition) && hasPersistedYjsState)
+  const shouldCommitCanonical = hasPersistedYjsState
     || Boolean(yjsBackedMutationBase)
     || (typeof targetMarkdown === 'string'
       && stripEphemeralCollabSpans(targetMarkdown) !== persistedMarkdown);

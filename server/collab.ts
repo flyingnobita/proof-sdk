@@ -31,6 +31,7 @@ import {
   listDocsWithStaleProjection,
   listSuspiciousProjectionCandidates,
   noteDocumentLiveCollabLease,
+  removeResurrectedMarksFromPayload,
   replaceDocumentProjection,
   saveYSnapshot,
   setDocumentProjectionHealth,
@@ -2782,15 +2783,18 @@ export function mergePreservedActionMarks(
   incomingMarks: Record<string, unknown>,
   options: { includeSuggestions?: boolean } = {},
 ): Record<string, unknown> {
+  const scrubbed = removeResurrectedMarksFromPayload(slug, incomingMarks);
+  const nextMarks: Record<string, unknown> = { ...scrubbed.marks };
+  const removedSet = new Set(scrubbed.removed);
   const row = getDocumentBySlug(slug);
-  if (!row) return incomingMarks;
+  if (!row) return nextMarks;
 
   const existingMarks = parseStoredMarks(row.marks);
   let preserved = 0;
   for (const [markId, value] of Object.entries(existingMarks)) {
-    if (incomingMarks[markId] !== undefined) continue;
+    if (removedSet.has(markId) || nextMarks[markId] !== undefined) continue;
     if (!shouldPreserveMissingMark(value, options)) continue;
-    incomingMarks[markId] = value;
+    nextMarks[markId] = value;
     preserved += 1;
   }
 
@@ -2798,10 +2802,10 @@ export function mergePreservedActionMarks(
     console.warn('[collab] preserved non-authored marks from DB during projection materialization', {
       slug,
       preserved,
-      incomingMarkCount: Object.keys(incomingMarks).length,
+      incomingMarkCount: Object.keys(nextMarks).length,
     });
   }
-  return incomingMarks;
+  return nextMarks;
 }
 
 function touchDoc(slug: string): void {
@@ -7678,6 +7682,7 @@ async function persistDoc(
       }
       // Read docRow inside the transaction to avoid stale comparisons
       let shouldWriteProjection = true;
+      let projectionSkippedUnchangedAndFresh = false;
       if (isCollabQuarantined(slug)) {
         shouldWriteProjection = false;
         skipPersistedStateWrite = sourceActor === 'collab';
@@ -7728,6 +7733,7 @@ async function persistDoc(
             if (marksUnchanged && markdownUnchanged) {
               if (isProjectionFresh(projectedRow)) {
                 shouldWriteProjection = false;
+                projectionSkippedUnchangedAndFresh = true;
               } else {
                 // Projection is stale but the canonical markdown/marks are unchanged.
                 // Heal the projection without bumping the document revision.
@@ -7901,6 +7907,9 @@ async function persistDoc(
         // to prevent repeated stale-projection detection on startup.
         const yStateVersion = getLatestYStateVersion(slug);
         db.prepare('UPDATE documents SET y_state_version = ? WHERE slug = ? AND share_state IN (\'ACTIVE\', \'PAUSED\')').run(yStateVersion, slug);
+        if (projectionSkippedUnchangedAndFresh) {
+          db.prepare('UPDATE document_projections SET y_state_version = ? WHERE document_slug = ?').run(yStateVersion, slug);
+        }
       }
     });
     persistTx();
@@ -10895,6 +10904,63 @@ export function buildCollabSession(
   return session;
 }
 
+function hasNonEmptyClientSyncUpdate(rawMessage: Uint8Array): boolean {
+  try {
+    let offset = 0;
+    const readVarUint = (): number => {
+      let value = 0;
+      let multiplier = 1;
+      while (offset < rawMessage.length) {
+        const byte = rawMessage[offset++];
+        value += (byte & 0x7f) * multiplier;
+        if (byte < 0x80) return value;
+        multiplier *= 128;
+      }
+      throw new RangeError('Unexpected end of varUint');
+    };
+    const docNameLen = readVarUint();
+    if (offset + docNameLen > rawMessage.length) {
+      throw new RangeError('Unexpected end of document name');
+    }
+    offset += docNameLen;
+    const messageType = readVarUint();
+    // MessageType.Sync (0) and MessageType.SyncReply (4) carry Yjs sync payloads.
+    if (messageType !== 0 && messageType !== 4) {
+      return false;
+    }
+    const syncMessageType = readVarUint();
+    // 1 = messageYjsSyncStep2, 2 = messageYjsUpdate
+    if (syncMessageType !== 1 && syncMessageType !== 2) {
+      return false;
+    }
+    const updateLen = readVarUint();
+    if (offset + updateLen > rawMessage.length) {
+      throw new RangeError('Unexpected end of Yjs update');
+    }
+    const yjsUpdate = rawMessage.subarray(offset, offset + updateLen);
+    const decoded = Y.decodeUpdate(yjsUpdate);
+    return decoded.structs.length > 0 || decoded.ds.clients.size > 0;
+  } catch {
+    return true;
+  }
+}
+
+async function handleCollabBeforeHandleMessage(data: {
+  documentName: string;
+  update: Uint8Array;
+}): Promise<void> {
+  if (!isRewriteLocked(data.documentName)) return;
+  if (!hasNonEmptyClientSyncUpdate(data.update)) return;
+  console.warn('[collab] beforeHandleMessage rejected client update during rewrite lock', {
+    slug: data.documentName,
+    bytes: data.update.byteLength,
+  });
+  throw Object.assign(new Error('rewrite-locked'), {
+    code: 1013,
+    reason: 'rewrite-locked',
+  });
+}
+
 export function handleCollabWebSocketConnection(socket: unknown, request: unknown): void {
   attachCollabSocketErrorHandler(socket, request, 'ws-router');
   if (!hocuspocusInstance || typeof hocuspocusInstance.handleConnection !== 'function') {
@@ -10969,6 +11035,7 @@ export async function startCollabRuntime(mainHttpPort: number): Promise<CollabRu
       name: 'proof-collab',
       port: collabPort,
       address: collabHost,
+      beforeHandleMessage: handleCollabBeforeHandleMessage,
       async onAuthenticate(data: {
         documentName: string;
         socketId: string;
@@ -11160,6 +11227,7 @@ export async function startCollabRuntimeEmbedded(mainHttpPort: number): Promise<
     // Configure the collab runtime without binding a port. Connections are multiplexed onto /ws.
     hocuspocusInstance = factory.configure({
       name: 'proof-collab',
+      beforeHandleMessage: handleCollabBeforeHandleMessage,
       async onAuthenticate(data: {
         documentName: string;
         socketId: string;
@@ -11342,6 +11410,7 @@ export async function startCollabRuntimeAttached(mainHttpServer: HttpServer, mai
 
     hocuspocusInstance = factory.configure({
       name: 'proof-collab',
+      beforeHandleMessage: handleCollabBeforeHandleMessage,
       async onConnect(data: {
         documentName: string;
         socketId: string;
