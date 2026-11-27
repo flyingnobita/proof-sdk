@@ -154,6 +154,8 @@ type AutoReconnectClient = {
   getProvider: () => HocuspocusProvider;
   isConnectedAndSynced: () => boolean;
   getReconnectCount: () => number;
+  setReconnectDelayMs: (delayMs: number) => void;
+  reemitStaleMarksAndFragment: () => void;
   disconnect: () => void;
 };
 
@@ -164,19 +166,58 @@ async function connectCollabClient(
   options: {
     autoReconnectOnClose?: boolean;
     reemitStaleMarksOnReconnect?: boolean;
+    reemitFragmentSuggestionsOnReconnect?: boolean;
     touchFragmentAttrOnReconnect?: boolean;
+    reconnectDelayMs?: number;
   } = {},
 ): Promise<AutoReconnectClient> {
   let disposed = false;
   let reconnectInFlight = false;
   let reconnectCount = 0;
+  let reconnectDelayMs = options.reconnectDelayMs ?? 250;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let currentYdoc: Y.Doc | null = null;
   let currentProvider: HocuspocusProvider | null = null;
   let connected = false;
   let synced = false;
   const lastReceivedServerMarks: Record<string, unknown> = {};
 
+  const reemitInto = (ydoc: Y.Doc) => {
+    const marksMap = ydoc.getMap('marks');
+    if (options.reemitStaleMarksOnReconnect && Object.keys(lastReceivedServerMarks).length > 0) {
+      ydoc.transact(() => {
+        for (const [markId, value] of Object.entries(lastReceivedServerMarks)) {
+          if (!marksMap.has(markId)) {
+            marksMap.set(markId, value);
+          }
+        }
+      }, 'browser-last-received-marks-reemit');
+    }
+    if (options.reemitFragmentSuggestionsOnReconnect) {
+      for (const [markId, raw] of Object.entries(lastReceivedServerMarks)) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+        const mark = raw as { kind?: unknown; quote?: unknown; by?: unknown; content?: unknown; status?: unknown };
+        if (
+          (mark.kind === 'replace' || mark.kind === 'insert' || mark.kind === 'delete')
+          && typeof mark.quote === 'string'
+          && mark.quote.length > 0
+        ) {
+          hydrateSuggestionMarkInFragment(ydoc, mark.quote, {
+            id: markId,
+            kind: mark.kind,
+            by: typeof mark.by === 'string' && mark.by ? mark.by : 'ai:reviewer',
+            ...(typeof mark.content === 'string' ? { content: mark.content } : {}),
+          });
+        }
+      }
+    }
+  };
+
   const destroyCurrent = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
     if (currentProvider) {
       try {
         currentProvider.disconnect();
@@ -240,13 +281,14 @@ async function connectCollabClient(
       if (disposed || !options.autoReconnectOnClose || reconnectInFlight) return;
       reconnectInFlight = true;
       reconnectCount += 1;
-      setTimeout(() => {
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
         void connectOnce(true).catch(() => {
           // retry loop handled by next disconnect or waitFor timeout
         }).finally(() => {
           reconnectInFlight = false;
         });
-      }, 40);
+      }, reconnectDelayMs);
     };
 
     provider.on('status', (event: { status: string }) => {
@@ -263,15 +305,12 @@ async function connectCollabClient(
         synced = true;
         captureServerMarks();
         if (isReconnect) {
-          if (options.reemitStaleMarksOnReconnect && Object.keys(lastReceivedServerMarks).length > 0) {
-            ydoc.transact(() => {
-              for (const [markId, value] of Object.entries(lastReceivedServerMarks)) {
-                if (!marksMap.has(markId)) {
-                  marksMap.set(markId, value);
-                }
-              }
-            }, 'browser-last-received-marks-reemit');
-          }
+          reemitInto(ydoc);
+          setTimeout(() => {
+            if (!disposed && currentYdoc === ydoc && synced) {
+              reemitInto(ydoc);
+            }
+          }, 150);
           if (options.touchFragmentAttrOnReconnect) {
             touchFragmentAttributes(ydoc, `reconnect-${reconnectCount}`);
           }
@@ -304,6 +343,12 @@ async function connectCollabClient(
     },
     isConnectedAndSynced: () => connected && synced,
     getReconnectCount: () => reconnectCount,
+    setReconnectDelayMs: (delayMs: number) => {
+      reconnectDelayMs = delayMs;
+    },
+    reemitStaleMarksAndFragment: () => {
+      if (currentYdoc) reemitInto(currentYdoc);
+    },
     disconnect: () => {
       disposed = true;
       destroyCurrent();
@@ -316,7 +361,6 @@ async function runLiveMarksAcceptProjectionStaleRegressionTest(): Promise<void> 
   const dbPath = path.join(os.tmpdir(), dbName);
   process.env.DATABASE_PATH = dbPath;
   process.env.COLLAB_EMBEDDED_WS = '1';
-  process.env.AGENT_EDIT_COLLAB_STABILITY_MS = '500';
   process.env.AGENT_EDIT_COLLAB_STABILITY_SAMPLE_MS = '50';
 
   const [{ apiRoutes }, { agentRoutes }, { createBridgeMountRouter }, { setupWebSocket }, collab] = await Promise.all([
@@ -449,6 +493,7 @@ async function runLiveMarksAcceptProjectionStaleRegressionTest(): Promise<void> 
     const client2 = await connectCollabClient(httpBase, doc2.slug, doc2.ownerSecret, {
       autoReconnectOnClose: true,
       reemitStaleMarksOnReconnect: true,
+      reemitFragmentSuggestionsOnReconnect: true,
       touchFragmentAttrOnReconnect: true,
     });
     cleanups.push(client2.disconnect);
@@ -571,6 +616,9 @@ async function runLiveMarksAcceptProjectionStaleRegressionTest(): Promise<void> 
     await waitFor(() => client2.getProvider().unsyncedChanges === 0, 5_000, 'pass2 insert hydration flush');
     await sleep(600);
 
+    // Simulate real browser reconnect latency (~5.15s) crossing the 5s cooldown
+    // while default collab stability verification is still in flight.
+    client2.setReconnectDelayMs(5_150);
     const reconnectsBeforeAccept2 = client2.getReconnectCount();
     const accept2bRes = await fetch(`${httpBase}/api/agent/${doc2.slug}/marks/accept`, {
       method: 'POST',
@@ -595,6 +643,7 @@ async function runLiveMarksAcceptProjectionStaleRegressionTest(): Promise<void> 
       `Pass 2 Accept 2 expected confirmed collab status, got ${JSON.stringify(accept2bPayload.collab)}`,
     );
 
+    client2.setReconnectDelayMs(250);
     await waitFor(
       () => client2.getReconnectCount() > reconnectsBeforeAccept2
         && client2.isConnectedAndSynced()
@@ -603,6 +652,8 @@ async function runLiveMarksAcceptProjectionStaleRegressionTest(): Promise<void> 
       10_000,
       'pass2 client2 reconnected and settled after Accept 2',
     );
+    client2.reemitStaleMarksAndFragment();
+    await waitFor(() => client2.getProvider().unsyncedChanges === 0, 5_000, 'pass2 post-accept2 stale reemit flush');
     await sleep(600);
 
     const state2bRes = await fetch(`${httpBase}/api/agent/${doc2.slug}/state`, {
@@ -611,8 +662,8 @@ async function runLiveMarksAcceptProjectionStaleRegressionTest(): Promise<void> 
     const state2b = await mustJson<StateResponse>(state2bRes, 'pass2 post-accept2 state');
     const markdown2b = typeof state2b.markdown === 'string' ? state2b.markdown : (state2b.content ?? '');
     assert(
-      markdown2b.includes('Gamma Inserted') && markdown2b.includes('Beta'),
-      `Pass 2 Accept 2 expected Gamma Inserted and Beta, got ${JSON.stringify(markdown2b)}`,
+      markdown2b.includes('Gamma Inserted') && markdown2b.includes('Beta') && !markdown2b.includes('data-proof="suggestion"'),
+      `Pass 2 Accept 2 expected Gamma Inserted and Beta without suggestion span, got ${JSON.stringify(markdown2b)}`,
     );
     assert(!state2b.marks?.[replaceMarkId2], 'Pass 2 expected replace suggestion cleared');
     assert(!state2b.marks?.[insertMarkId2], 'Pass 2 expected insert suggestion cleared');
