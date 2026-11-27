@@ -3586,6 +3586,15 @@ agentRoutes.post('/:slug/marks/accept', async (req: Request, res: Response) => {
     }
   }
   try {
+    if (barrierAcquired) {
+      // Keep the rewrite lock held across the full stability verification window
+      // (which can exceed the default 5s cooldown) until finally releases it.
+      const verificationLockTtlMs = Math.max(
+        15_000,
+        REWRITE_COLLAB_TIMEOUT_MS + EDIT_COLLAB_STABILITY_MS * 3 + 5_000,
+      );
+      acquireRewriteLock(slug, verificationLockTtlMs);
+    }
     const result = await executeDocumentOperationAsync(slug, 'POST', '/marks/accept', payload, mutationContext);
     maybeLogMarkHydrationMismatch(mutationRoute, slug, payload, mutationContext, result);
     if (result.status >= 200 && result.status < 300) {
