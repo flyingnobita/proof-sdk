@@ -2,7 +2,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import type { Server as HttpServer } from 'http';
 import * as Y from 'yjs';
 import { prosemirrorToYXmlFragment, yXmlFragmentToProseMirrorRootNode } from 'y-prosemirror';
-import { type Node as ProseMirrorNode, type Schema } from '@milkdown/prose/model';
+import { Fragment, type Node as ProseMirrorNode, type Schema } from '@milkdown/prose/model';
 import {
   appendYUpdate,
   bumpGlobalCollabAdmissionEpoch,
@@ -2782,15 +2782,49 @@ function shouldPreserveMissingMark(
 
 const TOMBSTONE_SCRUB_TRANSACTION_ORIGIN = 'server-tombstone-scrub';
 
-function scrubTombstonedMarksFromYDoc(slug: string, ydoc: Y.Doc): boolean {
+function getTombstonedSuggestionIdSet(slug: string): Set<string> {
   const tombstones = listMarkTombstonesForDocument(slug);
-  if (tombstones.length === 0) return false;
-  const tombstonedSuggestionIds = new Set<string>();
+  const ids = new Set<string>();
   for (const tombstone of tombstones) {
     if (tombstone.status === 'accepted' || tombstone.status === 'rejected') {
-      tombstonedSuggestionIds.add(tombstone.mark_id);
+      ids.add(tombstone.mark_id);
     }
   }
+  return ids;
+}
+
+function stripTombstonedSuggestionMarksFromProseMirrorNode(
+  node: ProseMirrorNode,
+  tombstonedSuggestionIds: Set<string>,
+): ProseMirrorNode {
+  if (tombstonedSuggestionIds.size === 0) return node;
+  const filteredMarks = node.marks.filter((mark) => {
+    if (mark.type.name !== 'proofSuggestion') return true;
+    const id = typeof mark.attrs?.id === 'string' ? mark.attrs.id : null;
+    return !(id && tombstonedSuggestionIds.has(id));
+  });
+  let updated: ProseMirrorNode = node;
+  if (node.childCount > 0) {
+    const nextChildren: ProseMirrorNode[] = [];
+    let childrenChanged = false;
+    for (let i = 0; i < node.childCount; i += 1) {
+      const child = node.child(i);
+      const nextChild = stripTombstonedSuggestionMarksFromProseMirrorNode(child, tombstonedSuggestionIds);
+      if (nextChild !== child) childrenChanged = true;
+      nextChildren.push(nextChild);
+    }
+    if (childrenChanged) {
+      updated = node.copy(Fragment.fromArray(nextChildren));
+    }
+  }
+  if (filteredMarks.length !== updated.marks.length) {
+    updated = updated.mark(filteredMarks);
+  }
+  return updated;
+}
+
+function scrubTombstonedMarksFromYDoc(slug: string, ydoc: Y.Doc): boolean {
+  const tombstonedSuggestionIds = getTombstonedSuggestionIdSet(slug);
   if (tombstonedSuggestionIds.size === 0) return false;
 
   const marksMap = ydoc.getMap('marks');
@@ -4544,16 +4578,20 @@ function maybeRecordBlockedLegacyReseed(
   }
 }
 
-async function deriveMarkdownProjectionFromFragment(doc: Y.Doc): Promise<string | null> {
+async function deriveMarkdownProjectionFromFragment(doc: Y.Doc, slug?: string): Promise<string | null> {
   if ((process.env.COLLAB_FORCE_DERIVE_FRAGMENT_MARKDOWN_FAILURE || '').trim() === '1') {
     return null;
   }
   try {
     const parser = await getHeadlessMilkdownParser();
-    const root = yXmlFragmentToProseMirrorRootNode(
+    const rawRoot = yXmlFragmentToProseMirrorRootNode(
       doc.getXmlFragment('prosemirror') as any,
       parser.schema as any,
     ) as ProseMirrorNode;
+    const tombstonedIds = slug ? getTombstonedSuggestionIdSet(slug) : null;
+    const root = tombstonedIds && tombstonedIds.size > 0
+      ? stripTombstonedSuggestionMarksFromProseMirrorNode(rawRoot, tombstonedIds)
+      : rawRoot;
     return await serializeMarkdown(root);
   } catch (error) {
     console.error('[collab] failed to derive markdown from fragment for projection repair', {
@@ -4680,7 +4718,7 @@ async function resolveLoadedDocFragmentMarkdown(
   const fragment = ydoc.getXmlFragment('prosemirror');
   const fragmentEmpty = isProsemirrorFragmentStructurallyEmpty(fragment);
   const yTextMarkdown = stripEphemeralCollabSpans(ydoc.getText('markdown').toString());
-  const derivedMarkdown = await deriveMarkdownProjectionFromFragment(ydoc);
+  const derivedMarkdown = await deriveMarkdownProjectionFromFragment(ydoc, slug);
   if (derivedMarkdown === null) {
     return {
       markdown: null,
@@ -4880,7 +4918,11 @@ async function refreshMarkdownTextFromFragment(
         markdown: synced.markdown,
       };
     }
-    if (projectionMatchesRow && !fragmentMatchesRow && !fragmentState.dirty) {
+    const equivalentRichAuthoredMetadataDiff = hasRichProjectionStructure(derivedFragmentMarkdown)
+      && hasRichProjectionStructure(currentMarkdown)
+      && normalizeRichProjectionVisibleText(derivedFragmentMarkdown)
+        === normalizeRichProjectionVisibleText(currentMarkdown);
+    if (projectionMatchesRow && !fragmentMatchesRow && !fragmentState.dirty && !equivalentRichAuthoredMetadataDiff) {
       return { deriveFailed: false, refreshed: false, markdown: currentMarkdown };
     }
     if (!fragmentState.dirty) {
@@ -5062,7 +5104,7 @@ async function repairProjectionFromFragment(
     });
     return quarantine.quarantined ? 'stop' : 'retry';
   }
-  const derivedMarkdown = await deriveMarkdownProjectionFromFragment(ydoc);
+  const derivedMarkdown = await deriveMarkdownProjectionFromFragment(ydoc, slug);
   if (derivedMarkdown === null) {
     recordProjectionRepair('failure', reasons.join('|') || 'derive_fragment_markdown_failed');
     return 'retry';
@@ -7695,7 +7737,6 @@ async function persistDoc(
       if (persistPauseHookForTests) {
         await persistPauseHookForTests({ slug });
       }
-      scrubTombstonedMarksFromYDoc(slug, ydoc);
       const refreshed = await refreshMarkdownTextFromFragment(slug, ydoc, 'server-projection-refresh');
       if (refreshed.blockedSuspiciousCollapse) {
         persistPending.delete(slug);
@@ -7722,6 +7763,7 @@ async function persistDoc(
       }
     const priorBaseline = getAuthoritativeBaseline(slug);
     const authoritativeDoc = buildComparableAuthoritativeDoc(priorBaseline?.snapshot ?? null, ydoc);
+    scrubTombstonedMarksFromYDoc(slug, authoritativeDoc);
     if (typeof projectionMarkdownOverride === 'string') {
       syncAuthoritativeMarkdownCache(authoritativeDoc, projectionMarkdownOverride, 'persist-authoritative-sync');
     }
@@ -11061,7 +11103,6 @@ async function handleCollabOnChange(data: {
     console.warn('[collab] onChange blocked by rewrite lock', { slug: data.documentName });
     return;
   }
-  scrubTombstonedMarksFromYDoc(data.documentName, data.document);
   rememberLoadedDoc(data.documentName, data.document);
   markDocChanged(data.documentName);
   schedulePersistDoc(data.documentName, data.document);
